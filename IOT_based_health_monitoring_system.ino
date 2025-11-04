@@ -1,137 +1,250 @@
-// ESP32 Patient Health Monitoring
-// MAX30102 (HR/SpO2) + LM35 (Temp) + LCD + ThingSpeak
 #include <Wire.h>
 #include "MAX30105.h"
 #include "spo2_algorithm.h"
-#include <LiquidCrystal_I2C.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include "ThingSpeak.h"
 
-///// Config /////
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
-const char* THINGSPEAK_APIKEY = "YOUR_THINGSPEAK_API_KEY";
-const char* THINGSPEAK_HOST = "http://api.thingspeak.com/update";
+// ---------- OLED SETUP ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-const int SDA_PIN = 21;
-const int SCL_PIN = 22;
-const int LM35_PIN = 36;  // GPIO36 (ADC1_CH0) on ESP32
-const int BUFFER_SIZE = 100; // recommended for ESP32
-
-///// Hardware objects /////
+// ---------- MAX30102 SENSOR ----------
 MAX30105 particleSensor;
-LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-///// Algorithm buffers /////
-uint16_t irBuffer[BUFFER_SIZE];
-uint16_t redBuffer[BUFFER_SIZE];
+// ---------- ESP32 I2C PINS ----------
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// ---------- BUFFER AND ALGORITHM SETTINGS ----------
+#define BUFFER_SIZE 100
+#define AVG_SIZE 5
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+
+// ---------- RESULTS ----------
 int32_t spo2;
 int8_t validSPO2;
 int32_t heartRate;
-int8_t validHeartRate;
+int8_t validHR;
 
-///// Reliable reading wrapper /////
-bool getReliableReading(int &outHR, int &outSPO2) {
-  for (int i = 0; i < BUFFER_SIZE; ++i) {
-    irBuffer[i] = particleSensor.getIR();
-    redBuffer[i] = particleSensor.getRed();
-    delay(20); // ~50Hz sampling
-  }
+// ---------- MOVING AVERAGE ----------
+int hrHistory[AVG_SIZE];
+int spo2History[AVG_SIZE];
+int hrIndex = 0;
+int spo2Index = 0;
 
-  maxim_heart_rate_and_oxygen_saturation(
-    irBuffer, BUFFER_SIZE, redBuffer,
-    &spo2, &validSPO2, &heartRate, &validHeartRate
-  );
+// ---------- WiFi + ThingSpeak ----------
+const char* ssid = "WIFI SSID";       // 🔹 Change this
+const char* password = "PASSWORD"; // 🔹 Change this
+unsigned long myChannelNumber =CHANNEL ID;     // 🔹 Change this
+const char* myWriteAPIKey = "API KEY";  // 🔹 Change this
 
-  if (validHeartRate && validSPO2) {
-    outHR = (int)heartRate;
-    outSPO2 = (int)spo2;
-    return true;
-  }
-  return false;
-}
+WiFiClient client;
 
-void wifiConnect() {
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to WiFi");
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 40) {
-    delay(500); Serial.print(".");
-    tries++;
+// ---------- Function to calculate average ----------
+int getAverage(int* array, int size) {
+  long sum = 0;
+  int count = 0;
+  for (int i = 0; i < size; i++) {
+    if (array[i] > 0) {
+      sum += array[i];
+      count++;
+    }
   }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connected: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("WiFi connect failed");
-  }
+  return (count > 0) ? (sum / count) : 0;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(1000);
 
-  // I2C and LCD init
-  Wire.begin(SDA_PIN, SCL_PIN);
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Starting...");
+  Wire.begin(I2C_SDA, I2C_SCL, 400000);
 
-  // start MAX30102
-  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    Serial.println("MAX30102 not found. Check wiring.");
-    lcd.setCursor(0,1); lcd.print("MAX30102 fail");
-    while (1) delay(1000);
+  // OLED initialization
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("❌ OLED not found!");
+    while (1);
   }
-  particleSensor.setup(); // default setup
-  particleSensor.setPulseAmplitudeRed(0x1F);
-  particleSensor.setPulseAmplitudeIR(0x1F);
 
-  wifiConnect();
-  lcd.clear();
-  lcd.print("Ready");
-  delay(500);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(10, 10);
+  display.println("Initializing...");
+  display.display();
+
+  // MAX30102 initialization
+  if (!particleSensor.begin(Wire, 400000)) {
+    Serial.println("❌ MAX30102 not found!");
+    display.clearDisplay();
+    display.setCursor(10, 20);
+    display.println("Sensor not found!");
+    display.display();
+    while (1);
+  }
+
+  // Configure sensor
+  particleSensor.setup(200, 8, 2, 100, 411, 16384);
+
+  // OLED display labels
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 10);
+  display.print("HR:");
+  display.setCursor(0, 35);
+  display.print("SpO2:");
+  display.display();
+
+  // WiFi connection
+  WiFi.begin(ssid, password);
+  Serial.print("🔌 Connecting to WiFi");
+  display.setTextSize(1);
+  display.setCursor(0, 55);
+  display.println("WiFi Connecting...");
+  display.display();
+
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    display.setCursor(0, 55);
+    display.print("WiFi OK ");
+    display.display();
+  } else {
+    Serial.println("\n⚠️ WiFi Connection Failed!");
+    display.setCursor(0, 55);
+    display.print("WiFi Fail ");
+    display.display();
+  }
+
+  ThingSpeak.begin(client);
+  delay(1000);
 }
 
 void loop() {
-  // read LM35 temperature
-  int raw = analogRead(LM35_PIN);      
-  float voltage = (raw / 4095.0) * 3.3; // ESP32 ADC 12-bit
-  float tempC = voltage * 100.0;       
+  const int measureTime = 20000; // 20 seconds per cycle
+  unsigned long startTime = millis();
 
-  // get HR & SpO2
-  int hr = 0, sp = 0;
-  bool ok = getReliableReading(hr, sp);
+  long sumHR = 0;
+  long sumSpO2 = 0;
+  int countValidHR = 0;
+  int countValidSpO2 = 0;
 
-  // LCD output
-  lcd.setCursor(0,0);
-  if (ok) {
-    lcd.printf("HR:%3d SpO2:%2d", hr, sp);
+  for (int i = 0; i < AVG_SIZE; i++) {
+    hrHistory[i] = 0;
+    spo2History[i] = 0;
+  }
+  hrIndex = 0;
+  spo2Index = 0;
+
+  while (millis() - startTime < measureTime) {
+    // Shift buffer
+    for (int i = 0; i < BUFFER_SIZE - 1; i++) {
+      redBuffer[i] = redBuffer[i + 1];
+      irBuffer[i] = irBuffer[i + 1];
+    }
+
+    // Read new sample
+    while (!particleSensor.available()) {
+      particleSensor.check();
+    }
+
+    redBuffer[BUFFER_SIZE - 1] = particleSensor.getRed();
+    irBuffer[BUFFER_SIZE - 1] = particleSensor.getIR();
+    particleSensor.nextSample();
+
+    // Process data
+    if (irBuffer[BUFFER_SIZE - 1] < 5000) {
+      validHR = 0;
+      validSPO2 = 0;
+    } else {
+      maxim_heart_rate_and_oxygen_saturation(
+        irBuffer, BUFFER_SIZE, redBuffer,
+        &spo2, &validSPO2, &heartRate, &validHR
+      );
+    }
+
+    // Collect valid readings
+    if (validHR && heartRate > 40 && heartRate < 180) {
+      sumHR += heartRate;
+      countValidHR++;
+    }
+    if (validSPO2 && spo2 > 80 && spo2 <= 100) {
+      sumSpO2 += spo2;
+      countValidSpO2++;
+    }
+
+    // Update moving average
+    hrHistory[hrIndex % AVG_SIZE] = (validHR) ? heartRate : 0;
+    spo2History[spo2Index % AVG_SIZE] = (validSPO2) ? spo2 : 0;
+    hrIndex++;
+    spo2Index++;
+
+    // OLED display update
+    display.fillRect(40, 10, 80, 20, SSD1306_BLACK);
+    display.setCursor(40, 10);
+    display.print(getAverage(hrHistory, AVG_SIZE));
+
+    display.fillRect(60, 35, 80, 20, SSD1306_BLACK);
+    display.setCursor(60, 35);
+    display.print(getAverage(spo2History, AVG_SIZE));
+    display.display();
+
+    delay(200);
+  }
+
+  // Compute final averages
+  int avgHR = (countValidHR > 0) ? (sumHR / countValidHR) : -1;
+  int avgSpO2 = (countValidSpO2 > 0) ? (sumSpO2 / countValidSpO2) : -1;
+
+  Serial.print("Average HR: ");
+  if (avgHR > 0) Serial.print(avgHR);
+  else Serial.print("---");
+  Serial.print(" bpm | Average SpO2: ");
+  if (avgSpO2 > 0) Serial.print(avgSpO2);
+  else Serial.print("---");
+  Serial.println(" %");
+
+  // Update OLED display
+  display.fillRect(40, 10, 80, 20, SSD1306_BLACK);
+  display.setCursor(40, 10);
+  if (avgHR > 0) display.print(avgHR);
+  else display.print("--");
+
+  display.fillRect(60, 35, 80, 20, SSD1306_BLACK);
+  display.setCursor(60, 35);
+  if (avgSpO2 > 0) display.print(avgSpO2);
+  else display.print("--");
+
+  display.display();
+
+  // ---------- Upload to ThingSpeak ----------
+  if (WiFi.status() == WL_CONNECTED) {
+    ThingSpeak.setField(1, avgHR);
+    ThingSpeak.setField(2, avgSpO2);
+
+    int statusCode = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+
+    if (statusCode == 200) {
+      Serial.println("✅ Data uploaded to ThingSpeak!");
+    } else {
+      Serial.print("⚠️ Upload failed. Code: ");
+      Serial.println(statusCode);
+    }
   } else {
-    lcd.print("Measuring...     ");
-  }
-  lcd.setCursor(0,1);
-  lcd.printf("T:%4.1fC           ", tempC);
-
-  // Serial monitor
-  Serial.print("Temp: "); Serial.print(tempC,1);
-  Serial.print(" C, HR: "); Serial.print(ok?hr:-1);
-  Serial.print(" bpm, SpO2: "); Serial.println(ok?sp:-1);
-
-  // ThingSpeak upload
-  if (WiFi.status() == WL_CONNECTED && ok) {
-    HTTPClient http;
-    String url = String(THINGSPEAK_HOST) + "?api_key=" + THINGSPEAK_APIKEY +
-                 "&field1=" + String(hr) +
-                 "&field2=" + String(sp) +
-                 "&field3=" + String(tempC,1);
-    http.begin(url);
-    int code = http.GET();
-    Serial.print("ThingSpeak HTTP code: "); Serial.println(code);
-    http.end();
+    Serial.println("⚠️ Skipped upload (No WiFi)");
   }
 
-  delay(15000); // ThingSpeak requires ≥15s between updates
+  delay(15000); // Wait before next reading cycle
 }
